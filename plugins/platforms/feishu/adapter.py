@@ -156,6 +156,34 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+# ``/topic`` in a Feishu DM is the topic-mode switch. No argument turns the mode ON: from then on
+# every question typed in the main DM is answered inside its own topic. ``status`` reports the
+# current state, ``off`` leaves the mode, ``help`` prints the usage, and any other argument turns
+# the mode on *and* opens one titled topic right away. Chinese aliases match the UI habit. State is
+# command-driven and persisted per chat in ``<hermes_home>/feishu_topic_mode.json`` — never in
+# config, so a DM that never ran the command keeps stock Hermes behavior.
+_FEISHU_TOPIC_COMMANDS = frozenset({"/topic", "/新话题", "/开个话题"})
+_FEISHU_TOPIC_STATUS_ARGS = frozenset({"status", "state", "状态", "查询", "查看", "?"})
+_FEISHU_TOPIC_OFF_ARGS = frozenset({"off", "disable", "stop", "关闭", "退出", "关掉"})
+_FEISHU_TOPIC_HELP_ARGS = frozenset({"help", "帮助", "用法"})
+_FEISHU_TOPIC_STATE_FILE = "feishu_topic_mode.json"
+# Feishu has no "create topic" endpoint — a reply carrying ``reply_in_thread`` is the only way. So
+# topic mode never pre-creates the topic: the gateway stamps the QUESTION's message id as the
+# session's thread key, and the answer's own reply to that question opens the topic as its first
+# post (no placeholder). ``_remember_topic_thread`` then maps the real thread id back to the anchor,
+# so a follow-up typed inside the topic resolves to the session its question opened.
+_FEISHU_TOPIC_ANCHOR_MAP_LIMIT = 500
+_FEISHU_TOPIC_ENABLED_TEXT = (
+    "🗂 topic 模式已开启 — 主会话提问自动开新话题回答。\n"
+    "查看状态 /topic status，退出 /topic off"
+)
+_FEISHU_TOPIC_HELP_TEXT = (
+    "🗂 /topic\n"
+    "/topic — 开启\n"
+    "/topic status — 查看状态\n"
+    "/topic off — 关闭\n"
+    "/topic <标题> — 开一个带标题的话题"
+)
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once", "approve_session": "session", "approve_always": "always", "deny": "deny",
@@ -206,6 +234,7 @@ FALLBACK_SHARE_CHAT_TEXT = "[Shared chat]"
 FALLBACK_INTERACTIVE_TEXT = "[Interactive message]"
 FALLBACK_IMAGE_TEXT = "[Image]"
 FALLBACK_ATTACHMENT_TEXT = "[Attachment]"
+FALLBACK_LOCATION_TEXT = "[The user shared a location pin.]"
 # --- Post/card parsing helpers ---
 _PREFERRED_LOCALES = ("zh_cn", "en_us")
 _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
@@ -639,6 +668,8 @@ def normalize_feishu_message(
             mentions=list(mentions_map.values()), relation_kind="post",
         )
     mention_refs = list(mentions_map.values())
+    if normalized_type == "location":
+        return _normalize_location_message(payload)
     if normalized_type == "image":
         image_key = str(payload.get("image_key", "") or "").strip()
         alt_text = _normalize_feishu_text(
@@ -686,6 +717,31 @@ def _normalize_merge_forward_message(payload: Dict[str, Any]) -> FeishuNormalize
     return FeishuNormalizedMessage(
         raw_type="merge_forward", text_content="\n".join(lines).strip() or FALLBACK_FORWARD_TEXT,
         relation_kind="merge_forward", metadata={"entry_count": len(entries), "title": title},
+    )
+
+
+def _normalize_location_message(payload: Dict[str, Any]) -> FeishuNormalizedMessage:
+    """Feishu location pin: ``{"name": "xx省xx市", "longitude": "113.9", "latitude": "22.5"}``.
+
+    Coordinates arrive as strings; keep them verbatim and append a map link so the agent can
+    resolve the pin without guessing a provider URL.
+    """
+    name = _first_text_field(payload, "name", "title", "address", "text")
+    latitude = _first_text_field(payload, "latitude", "lat")
+    longitude = _first_text_field(payload, "longitude", "lng", "lon")
+    lines = [FALLBACK_LOCATION_TEXT]
+    if name:
+        lines.append(f"Location: {name}")
+    if latitude and longitude:
+        lines.append(f"latitude: {latitude}")
+        lines.append(f"longitude: {longitude}")
+        lines.append(f"Map: https://www.google.com/maps/search/?api=1&query={latitude},{longitude}")
+    elif latitude or longitude:
+        lines.append(f"latitude: {latitude}" if latitude else f"longitude: {longitude}")
+    return FeishuNormalizedMessage(
+        raw_type="location", text_content="\n".join(lines), preferred_message_type="location",
+        relation_kind="location",
+        metadata={"name": name, "latitude": latitude, "longitude": longitude},
     )
 
 
@@ -1222,6 +1278,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
+        # Feishu DM topic mode (`/topic`): command-driven state, persisted per chat.
+        self._topic_state_lock = threading.RLock()
+        self._topic_state_cache: Optional[Dict[str, Any]] = None
         # Serializes the offloaded dedup-state flushes so two concurrent
         # inbound messages cannot land their writes out of order.
         self._dedup_persist_lock = asyncio.Lock()
@@ -2505,6 +2564,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 text = f"{hint}\n\n{text}" if text else hint
 
         thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        if thread_id:
+            # Topic mode: keep a follow-up typed inside the topic on the session its question
+            # opened (the real thread id is mapped back to the anchor stamped at ingest).
+            thread_id = self._topic_anchor_for_thread(thread_id) or thread_id
         reply_to_message_id = (
             getattr(message, "parent_id", None) or getattr(message, "upper_message_id", None)
             or getattr(message, "root_id", None) or None
@@ -2520,6 +2583,19 @@ class FeishuAdapter(BasePlatformAdapter):
             "dm" if chat_type == "p2p" else "group", message_id, inbound_type.value, chat_id,
             "bot" if is_bot else "user", sender_primary, text[:120], len(media_urls),
         )
+
+        # Feishu DM ``/topic``: the topic-mode switch (``/topic`` on, ``/topic status``, ``/topic off``,
+        # ``/topic <标题>`` opens one right away). With the mode on, every later question in the main DM
+        # is answered inside its own topic, so the main DM stays a launcher instead of piling up the chat.
+        if inbound_type == MessageType.COMMAND and chat_type == "p2p":
+            _parts = text.strip().split(maxsplit=1)
+            _cmd = _parts[0].lower().split("@", 1)[0] if _parts else ""
+            if _cmd in _FEISHU_TOPIC_COMMANDS:
+                await self._handle_topic_command_message(
+                    chat_id=chat_id, message_id=message_id, thread_id=thread_id,
+                    arg=(_parts[1].strip() if len(_parts) > 1 else ""), user_id=sender_primary,
+                )
+                return
 
         chat_info = await self.get_chat_info(chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
@@ -2551,6 +2627,260 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._enqueue_media_event(event)
             return
         await self._handle_message_with_guards(event)
+
+    # --- Feishu DM topic mode / command ---
+    # Command-driven, persisted per chat in ``<hermes_home>/feishu_topic_mode.json``:
+    #   {"version": 1,
+    #    "chats": {"<chat_id>": {"enabled": bool, "user_id": str,
+    #                             "activated_at": float, "updated_at": float}},
+    #    "threads": {"<thread_id>": "<anchor message id>"}}   # topic → the session it opened
+    # There is deliberately no config switch: a DM that never ran ``/topic`` behaves exactly like
+    # stock Hermes. Reads tolerate a missing or corrupt file by reporting "off" — a bad state file
+    # must never take the adapter (or the user's chat) down.
+    _FEISHU_TOPIC_INIT_LOCK = threading.Lock()
+
+    def _topic_lock(self) -> threading.RLock:
+        """Per-instance state lock (bare adapters built via ``object.__new__`` get one lazily)."""
+        lock = getattr(self, "_topic_state_lock", None)
+        if lock is None:
+            with FeishuAdapter._FEISHU_TOPIC_INIT_LOCK:
+                lock = getattr(self, "_topic_state_lock", None) or threading.RLock()
+                self._topic_state_lock = lock
+        return lock
+
+    def _topic_state_path(self) -> Path:
+        return get_hermes_home() / _FEISHU_TOPIC_STATE_FILE
+
+    def _load_topic_state(self) -> Dict[str, Any]:
+        """Parsed state file, cached per adapter instance (missing/corrupt → empty state)."""
+        with self._topic_lock():
+            cached = getattr(self, "_topic_state_cache", None)
+            if cached is not None:
+                return cached
+            state: Dict[str, Any] = {"version": 1, "chats": {}, "threads": {}}
+            try:
+                raw = json.loads(self._topic_state_path().read_text(encoding="utf-8"))
+                if isinstance(raw, dict) and isinstance(raw.get("chats"), dict):
+                    threads = raw.get("threads")
+                    state = {
+                        "version": int(raw.get("version") or 1),
+                        "chats": raw["chats"],
+                        "threads": dict(threads) if isinstance(threads, dict) else {},
+                    }
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.warning(
+                    "[Feishu] Unreadable topic-mode state file %s; treating topic mode as off",
+                    self._topic_state_path(), exc_info=True)
+            self._topic_state_cache = state
+            return state
+
+    def topic_mode_record(self, chat_id: str) -> Dict[str, Any]:
+        """Persisted topic-mode record for one chat (``{}`` when it never opted in)."""
+        try:
+            record = self._load_topic_state()["chats"].get(str(chat_id))
+        except Exception:
+            logger.warning("[Feishu] topic state read failed for chat %s", chat_id, exc_info=True)
+            return {}
+        return dict(record) if isinstance(record, dict) else {}
+
+    def topic_mode_enabled(self, chat_id: str = "") -> bool:
+        """True when this DM opted into topic mode via ``/topic``."""
+        return bool(self.topic_mode_record(chat_id).get("enabled"))
+
+    def set_topic_mode(self, chat_id: str, enabled: bool, *, user_id: str = "") -> Optional[bool]:
+        """Persist the switch for one chat.
+
+        Returns the new state, or ``None`` when the state file could not be written — the caller
+        must then tell the user the switch did not take effect instead of pretending it did. The
+        in-memory cache is only updated after the atomic write lands, so a failed write leaves the
+        previous state (and the previous behavior) intact. Never raises.
+        """
+        chat_id = str(chat_id)
+        now = time.time()
+        try:
+            with self._topic_lock():
+                state = self._load_topic_state()
+                chats = dict(state.get("chats") or {})
+                record = dict(chats.get(chat_id) or {})
+                record["enabled"] = bool(enabled)
+                record["updated_at"] = now
+                if user_id:
+                    record["user_id"] = str(user_id)
+                if enabled:
+                    record.setdefault("activated_at", now)
+                chats[chat_id] = record
+                atomic_json_write(
+                    self._topic_state_path(),
+                    {
+                        "version": int(state.get("version") or 1),
+                        "chats": chats,
+                        "threads": dict(state.get("threads") or {}),
+                    },
+                )
+                state["chats"] = chats
+            logger.info(
+                "[Feishu] topic mode %s for chat %s", "enabled" if enabled else "disabled", chat_id)
+            return bool(enabled)
+        except Exception:
+            logger.warning("[Feishu] Failed to persist topic mode for chat %s", chat_id, exc_info=True)
+            return None
+
+    def topic_mode_status_text(self, chat_id: str, *, in_topic: bool = False) -> str:
+        """One-shot status reply for ``/topic status``."""
+        record = self.topic_mode_record(chat_id)
+        if not record.get("enabled"):
+            return "🗂 topic 模式：已关闭（发送 /topic 开启）"
+        if in_topic:
+            return "🗂 topic 模式：已开启（已在话题内，直接说话即可）\n退出 /topic off"
+        return "🗂 topic 模式：已开启\n退出 /topic off"
+
+    def _remember_topic_thread(self, response: Any, *, anchor: str) -> None:
+        """Persist ``real thread_id → anchor message id`` once a reply has opened/joined a topic.
+
+        Called for every reply sent with a topic-mode anchor as its thread key. The first such reply
+        creates the topic, so the mapping is written exactly once per thread; the cap only drops the
+        oldest entries. Never raises — a failed write costs session continuity, not the message.
+        """
+        thread_id = self._extract_response_field(response, "thread_id")
+        if not thread_id or str(thread_id) == str(anchor):
+            return
+        thread_id = str(thread_id)
+        try:
+            with self._topic_lock():
+                state = self._load_topic_state()
+                threads = dict(state.get("threads") or {})
+                if threads.get(thread_id) == str(anchor):
+                    return
+                threads[thread_id] = str(anchor)
+                if len(threads) > _FEISHU_TOPIC_ANCHOR_MAP_LIMIT:
+                    for stale in list(threads)[: len(threads) - _FEISHU_TOPIC_ANCHOR_MAP_LIMIT]:
+                        threads.pop(stale, None)
+                atomic_json_write(
+                    self._topic_state_path(),
+                    {
+                        "version": int(state.get("version") or 1),
+                        "chats": dict(state.get("chats") or {}),
+                        "threads": threads,
+                    },
+                )
+                state["threads"] = threads
+        except Exception:
+            logger.debug("[Feishu] Could not record topic thread mapping", exc_info=True)
+
+    def _topic_anchor_for_thread(self, thread_id: Any) -> Optional[str]:
+        """Anchor message id of a topic-mode thread, or ``None`` for any other id.
+
+        Topic-mode session keys use the question's message id (``om_…``); real Feishu thread ids are
+        ``omt_…``. Mapping an in-topic follow-up back to its anchor keeps it in the same session.
+        """
+        key = str(thread_id or "")
+        if not key.startswith("omt_"):
+            return None
+        try:
+            anchor = (self._load_topic_state().get("threads") or {}).get(key)
+        except Exception:
+            return None
+        return str(anchor) if anchor else None
+
+    async def open_topic_for_message(
+        self, message_id: str, *, seed_text: str = "", title: str = "",
+    ) -> Optional[str]:
+        """Open a Feishu topic anchored on *message_id*; return its ``thread_id`` or ``None``.
+
+        Feishu exposes no standalone "create topic" endpoint: a reply carrying ``reply_in_thread`` is
+        the only way, so the anchored message becomes the topic root and the seed text its first post.
+        """
+        if not self._client or not message_id:
+            logger.warning(
+                "[Feishu] Topic create skipped (client=%s message_id=%r)", bool(self._client), message_id)
+            return None
+        content = (seed_text or "🗂").strip()
+        if title:
+            content = f"{content}：{title}"
+        try:
+            body = self._build_reply_message_body(
+                content=json.dumps({"text": content}, ensure_ascii=False), msg_type="text",
+                reply_in_thread=True, uuid_value=str(uuid.uuid4()),
+            )
+            request = self._build_reply_message_request(message_id, body)
+            response = await self._run_blocking(self._client.im.v1.message.reply, request)
+            if not self._response_succeeded(response):
+                logger.warning(
+                    "[Feishu] Topic create failed for anchor %s: %s", message_id,
+                    self._response_error_result(response, default_message="topic create failed").error)
+                return None
+            thread_id = self._extract_response_field(response, "thread_id")
+            if not thread_id:
+                logger.warning("[Feishu] Topic create returned no thread_id for anchor %s", message_id)
+                return None
+            logger.info("[Feishu] Topic opened thread=%s anchor=%s title=%r", thread_id, message_id, title)
+            return str(thread_id)
+        except Exception as exc:
+            logger.warning("[Feishu] Topic create raised for anchor %s: %s", message_id, exc, exc_info=True)
+            return None
+
+    async def _handle_topic_command_message(
+        self, *, chat_id: str, message_id: str, thread_id: Optional[str],
+        arg: str = "", user_id: str = "",
+    ) -> None:
+        """Handle ``/topic`` in a Feishu DM: enable, ``status``, ``off``, ``help``, or enable+open.
+
+        ``/topic`` with no argument is the mode switch (the user's design: the command owns the
+        switch, never a config key). An arbitrary argument enables the mode *and* opens one titled
+        topic immediately, which also covers the old ``/topic <标题>`` habit.
+        """
+        if not self._client:
+            logger.warning("[Feishu] /topic ignored: adapter is not connected")
+            return
+        token = arg.strip()
+        lowered = token.lower()
+        in_topic = bool(thread_id)
+        metadata = {"thread_id": thread_id, "reply_to_message_id": message_id} if in_topic else None
+        reply_to = message_id if in_topic else None
+
+        if lowered in _FEISHU_TOPIC_OFF_ARGS:
+            if self.set_topic_mode(chat_id, False, user_id=user_id) is None:
+                await self.send(
+                    chat_id, "❌ 关闭失败：状态文件写入出错，topic 模式仍开启。",
+                    reply_to=reply_to, metadata=metadata,
+                )
+                return
+            await self.send(
+                chat_id, "🗂 topic 模式已关闭。",
+                reply_to=reply_to, metadata=metadata,
+            )
+            return
+        if lowered in _FEISHU_TOPIC_STATUS_ARGS:
+            await self.send(
+                chat_id, self.topic_mode_status_text(chat_id, in_topic=in_topic),
+                reply_to=reply_to, metadata=metadata,
+            )
+            return
+        if lowered in _FEISHU_TOPIC_HELP_ARGS:
+            await self.send(chat_id, _FEISHU_TOPIC_HELP_TEXT, reply_to=reply_to, metadata=metadata)
+            return
+
+        if self.set_topic_mode(chat_id, True, user_id=user_id) is None:
+            await self.send(
+                chat_id, "❌ 开启失败：状态文件写入出错。",
+                reply_to=reply_to, metadata=metadata,
+            )
+            return
+        if in_topic:
+            await self.send(
+                chat_id, "🗂 topic 模式已开启 — 已在话题内，直接说话即可。",
+                reply_to=reply_to, metadata=metadata,
+            )
+            return
+        if token:
+            if await self.open_topic_for_message(message_id, seed_text=f"🗂 {token}") is None:
+                await self.send(
+                    chat_id, "❌ 话题创建失败，下一条提问会自动重试。",
+                )
+            return
+        await self.send(chat_id, _FEISHU_TOPIC_ENABLED_TEXT)
 
     # --- Media batching ---
     def _should_batch_media_event(self, event: MessageEvent) -> bool:
@@ -2944,6 +3274,8 @@ class FeishuAdapter(BasePlatformAdapter):
         if preferred in ("photo", "document"):
             default = MessageType.PHOTO if preferred == "photo" else MessageType.DOCUMENT
             return self._resolve_media_message_type(media_types[0] if media_types else "", default=default)
+        if preferred == "location":
+            return MessageType.LOCATION
         return MessageType.TEXT
 
     async def _maybe_extract_text_document(self, cached_path: str, media_type: str) -> str:
@@ -3595,12 +3927,20 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         thread_id = (metadata or {}).get("thread_id")
         effective_reply_to = reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None)
+        # Topic mode stamps the question's message id as the thread key before the topic exists:
+        # replying to that anchor with ``reply_in_thread`` is what opens the topic — no placeholder.
+        anchor = thread_id if thread_id and not str(thread_id).startswith("omt_") else None
+        if anchor and not effective_reply_to:
+            effective_reply_to = str(anchor)
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload, msg_type=msg_type, reply_in_thread=bool(thread_id), uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(effective_reply_to, body)
-            return await self._run_blocking(self._client.im.v1.message.reply, request)
+            response = await self._run_blocking(self._client.im.v1.message.reply, request)
+            if anchor:
+                self._remember_topic_thread(response, anchor=str(anchor))
+            return response
         if thread_id:
             # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
             receive_id, receive_id_type = thread_id, "thread_id"

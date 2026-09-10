@@ -7,8 +7,8 @@ description: >
   Connects to Feishu (China) or Lark (International) via the official
   lark-oapi SDK over WebSocket or webhook and relays messages between
   Feishu/Lark chats and the Hermes agent. Supports text, images, video,
-  voice, documents, threads, DM pairing, group @mention gating, drive
-  comment events, and meeting invites.
+  voice, documents, locations, threads, DM pairing, group @mention gating,
+  drive comment events, and meeting invites.
 author: NousResearch
 requires_env:
   - name: FEISHU_APP_ID

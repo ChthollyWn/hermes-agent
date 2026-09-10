@@ -11,7 +11,7 @@ import re
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from agent.compaction_display import project_compaction_message_for_display
 from agent.i18n import t
@@ -293,6 +293,63 @@ class GatewayTopicThreadsMixin:
             )
         except Exception:
             logger.debug("Failed to send Telegram topic setup image", exc_info=True)
+
+    # ── Feishu topic mode (main DM = launcher, every question gets its own topic) ───────────
+
+    @staticmethod
+    def _is_feishu_dm(source: SessionSource) -> bool:
+        return source.platform == Platform.FEISHU and source.chat_type == "dm"
+
+    async def _hm_maybe_auto_open_feishu_topic(
+        self, event: MessageEvent, source: SessionSource,
+    ) -> Tuple[MessageEvent, SessionSource]:
+        """Feishu topic mode: a question typed in the main DM is answered inside its own topic.
+
+        The mode is switched on by the user's own ``/topic`` command (persisted per chat by the
+        adapter — there is no config key). While it is off the event passes through untouched and the
+        channel behaves exactly like stock Hermes. Runs after authz and BEFORE the session key is
+        derived, so the turn lands in its own session (``...:<chat_id>:<anchor message id>``) instead
+        of the launcher session. The topic itself is opened by the answer's reply — no placeholder
+        post — and the adapter maps that thread back to the anchor for the follow-ups. Commands stay
+        native in the launcher.
+
+        Never raises: a missing adapter, an API failure or an anchorless event falls back to
+        answering in the main DM rather than dropping the user's message.
+        """
+        try:
+            if getattr(event, "internal", False):
+                return event, source
+            if not self._is_feishu_dm(source) or getattr(source, "thread_id", None):
+                return event, source
+            if event.get_command():  # /new, /topic, /status … keep working in the launcher DM
+                return event, source
+            message_id = getattr(event, "message_id", None)
+            if not message_id:
+                return event, source
+            adapter: Any = self._adapter_for_source(source)
+            mode_fn: Any = getattr(adapter, "topic_mode_enabled", None)
+            if not callable(mode_fn) or not mode_fn(str(source.chat_id)):
+                return event, source
+            # No eager topic creation: Feishu has no create-topic endpoint, so the topic is opened
+            # by the answer's own ``reply_in_thread`` reply to this question. Stamping the question's
+            # message id as the thread key gives the turn its own session now, and the adapter maps
+            # the real thread back to this anchor so in-topic follow-ups share that session.
+            source.thread_id = str(message_id)
+            if getattr(event, "source", None) is not source:
+                event.source = source
+            resolve_prompt: Any = getattr(adapter, "_resolve_channel_prompt", None)
+            if callable(resolve_prompt):
+                with suppress(Exception):
+                    event.channel_prompt = resolve_prompt(str(source.chat_id), str(message_id))
+            logger.info(
+                "Feishu topic mode: chat=%s question=%s → own session; topic opens with the answer",
+                source.chat_id, message_id,
+            )
+            return event, source
+        except Exception:
+            logger.warning(
+                "Feishu topic mode: auto-open failed — answering in the main DM", exc_info=True)
+            return event, source
 
     # ── title sanitizers ────────────────────────────────────────────────────────────────────
 

@@ -102,6 +102,59 @@ class TestFeishuMessageNormalization(unittest.TestCase):
             "Build Failed\nService: payments-api\nBranch: main\nView Logs\nRetry\nActions: View Logs, Retry",
         )
 
+    def test_normalize_location_message_includes_name_coords_and_map_link(self):
+        from plugins.platforms.feishu.adapter import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="location",
+            raw_content=json.dumps(
+                {"name": "广东省深圳市南山区", "longitude": "113.946994", "latitude": "22.533266"}
+            ),
+        )
+
+        self.assertEqual(normalized.raw_type, "location")
+        self.assertEqual(normalized.preferred_message_type, "location")
+        self.assertEqual(normalized.relation_kind, "location")
+        self.assertEqual(normalized.metadata["latitude"], "22.533266")
+        self.assertEqual(normalized.metadata["longitude"], "113.946994")
+        self.assertEqual(
+            normalized.text_content,
+            "[The user shared a location pin.]\n"
+            "Location: 广东省深圳市南山区\n"
+            "latitude: 22.533266\n"
+            "longitude: 113.946994\n"
+            "Map: https://www.google.com/maps/search/?api=1&query=22.533266,113.946994",
+        )
+
+    def test_normalize_location_message_without_coordinates_still_readable(self):
+        from plugins.platforms.feishu.adapter import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="location", raw_content=json.dumps({"name": "某个位置"})
+        )
+
+        self.assertEqual(
+            normalized.text_content,
+            "[The user shared a location pin.]\nLocation: 某个位置",
+        )
+        self.assertEqual(normalized.metadata["latitude"], "")
+        self.assertEqual(normalized.metadata["longitude"], "")
+
+    def test_location_message_resolves_to_location_message_type(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.event import MessageType
+        from plugins.platforms.feishu.adapter import FeishuAdapter, normalize_feishu_message
+
+        adapter = FeishuAdapter(PlatformConfig())
+        normalized = normalize_feishu_message(
+            message_type="location",
+            raw_content=json.dumps({"name": "拉古那城", "longitude": "113.9", "latitude": "22.5"}),
+        )
+
+        self.assertEqual(
+            adapter._resolve_normalized_message_type(normalized, []), MessageType.LOCATION
+        )
+
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
@@ -2265,6 +2318,28 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
         self.assertEqual(len(mentions), 1)
         self.assertEqual(mentions[0].open_id, "ou_alice")
 
+    def test_extracts_location_message_as_readable_text(self):
+        adapter = self._build_adapter()
+        message = SimpleNamespace(
+            content=json.dumps(
+                {"name": "拉古那城", "longitude": "113.946994", "latitude": "22.533266"}
+            ),
+            message_type="location",
+            message_id="m_loc",
+            mentions=None,
+        )
+
+        text, inbound_type, media_urls, media_types, mentions = asyncio.run(
+            adapter._extract_message_content(message)
+        )
+
+        self.assertEqual(inbound_type.value, "location")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+        self.assertIn("拉古那城", text)
+        self.assertIn("22.533266", text)
+        self.assertIn("113.946994", text)
+
 
 class TestFeishuProcessInboundMessage(unittest.TestCase):
     def _build_adapter(self):
@@ -2358,6 +2433,37 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         event = adapter._dispatch_inbound_event.call_args.args[0]
         self.assertNotIn("[Mentioned:", event.text)
         self.assertTrue(event.text.startswith("/model"))
+
+    def test_location_message_reaches_dispatch_as_location_event(self):
+        from gateway.platforms.event import MessageType
+
+        adapter = self._build_adapter()
+        message = SimpleNamespace(
+            content=json.dumps(
+                {"name": "拉古那城", "longitude": "113.946994", "latitude": "22.533266"}
+            ),
+            message_type="location",
+            message_id="m4",
+            mentions=None,
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="m4",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.message_type, MessageType.LOCATION)
+        self.assertIn("拉古那城", event.text)
+        self.assertIn("22.533266", event.text)
+        self.assertEqual(event.media_urls, [])
 
 
 class TestFeishuFetchMessageText(unittest.TestCase):

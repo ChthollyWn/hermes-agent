@@ -4,7 +4,7 @@ encrypted CDN; ``qr_login`` backs the gateway setup wizard."""
 
 from __future__ import annotations
 
-import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, re, secrets, tempfile, textwrap, time, uuid  # noqa: E401
+import asyncio, base64, contextlib, hashlib, json, logging, mimetypes, os, re, secrets, subprocess, tempfile, textwrap, time, uuid  # noqa: E401
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -673,6 +673,17 @@ _file_item, _image_item = partial(_media_item, ITEM_FILE), partial(_media_item, 
 _video_item, _voice_item = partial(_media_item, ITEM_VIDEO), partial(_media_item, ITEM_VOICE)
 
 
+def _probe_play_length_seconds(path: str) -> int:
+    """Best-effort media duration in seconds for outbound video items; 0 when unknown."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+        return max(0, int(round(float(out))))
+    except Exception:
+        return 0
+
+
 # Inbound media dispatch: item type -> (item key, download timeout, cache fn, mime or None (= guess from
 # file_name), log label). Cache fns are lambdas so monkeypatching the module names takes effect at call time.
 _INBOUND_MEDIA: Dict[int, Tuple[str, float, Callable[[bytes, str], Awaitable[str]], Optional[str], str]] = {
@@ -916,7 +927,19 @@ class WeixinAdapter(BasePlatformAdapter):
             text=text, message_type=_message_type_from_media(media_types, text), source=source, raw_message=message,
             message_id=message_id or None, media_urls=media_paths, media_types=media_types, timestamp=datetime.now())
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
-        if event.message_type == MessageType.TEXT:
+        # Debounce text AND photo/video/doc so a near-follow-up caption (e.g. image then
+        # "这是谁啊") merges into one agent turn. Base ``_enqueue_text_event`` already
+        # concatenates text and extends media_urls. Voice stays immediate for STT latency.
+        # Set text_batch_delay_seconds=0 to restore per-message dispatch.
+        _batchable_media = {
+            MessageType.PHOTO, MessageType.VIDEO, MessageType.DOCUMENT, MessageType.STICKER,
+        }
+        if event.message_type == MessageType.TEXT or (
+            event.media_urls
+            and event.message_type in _batchable_media
+            and not event.is_command()
+            and self._text_batch_delay_seconds > 0
+        ):
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
@@ -944,6 +967,18 @@ class WeixinAdapter(BasePlatformAdapter):
         return build_session_key(
             event.source, group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False), profile=event.source.profile)
+
+    def _enqueue_text_event(self, event: MessageEvent) -> None:
+        """Batch text/media; if a photo merges into a pending text event, promote type to PHOTO."""
+        key = self._text_batch_key(event)
+        super()._enqueue_text_event(event)
+        pending = self._pending_text_batches.get(key)
+        if not pending or not pending.media_urls:
+            return
+        if pending.message_type == MessageType.TEXT and any(
+            (t or "").startswith("image/") for t in (pending.media_types or [])
+        ):
+            pending.message_type = MessageType.PHOTO
 
     async def _flush_text_batch(self, key: str) -> None:
         current_task = asyncio.current_task()
@@ -1155,10 +1190,10 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> SendResult:
         return await self._send_file_result(chat_id, file_path, caption or "", "send_document")
 
-    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to=None, metadata=None) -> SendResult:
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to=None, metadata=None, **kwargs: Any) -> SendResult:
         return await self._send_file_result(chat_id, video_path, caption or "", "send_video")
 
-    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to=None, metadata=None) -> SendResult:
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to=None, metadata=None, **kwargs: Any) -> SendResult:
         # Native outbound voice bubbles are not proven-working upstream; a file attachment at least plays (even .silk).
         return await self._send_file_result(chat_id, audio_path, caption or "[voice message as attachment]", "send_voice", force_file_attachment=True)
 
@@ -1196,6 +1231,10 @@ class WeixinAdapter(BasePlatformAdapter):
             "ciphertext_size": len(ciphertext), "plaintext_size": rawsize, "filename": Path(path).name, "rawfilemd5": rawfilemd5}
         if media_type == MEDIA_VOICE and path.endswith(".silk"):
             item_kwargs.update(encode_type=6, sample_rate=24000, bits_per_sample=16)
+        if media_type == MEDIA_VIDEO:
+            play_length = _probe_play_length_seconds(path)
+            if play_length:
+                item_kwargs["play_length"] = play_length
         if caption:
             await _send_message(
                 self._send_session, base_url=self._base_url, token=self._token, to=chat_id, text=self.format_message(caption),

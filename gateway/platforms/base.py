@@ -3975,8 +3975,12 @@ class BasePlatformAdapter(ABC):
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
-                # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                # Recompute at delivery time: a handler may change the event's routing state
+                # mid-turn (Feishu topic mode stamps the question's message id as ``thread_id``
+                # so the answer's reply opens its topic). The pre-handler snapshot above predates
+                # that stamp, and using it would send the answer as a plain reply in the main DM.
+                # Typing keeps the metadata it was started with.
+                _final_thread_metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):

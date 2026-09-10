@@ -1197,6 +1197,13 @@ class GatewayInboundMixin:
         if _paused_notice is not None:
             return _paused_notice
 
+        # Feishu topic mode: a question typed in the main DM opens (and is answered in) its own
+        # topic. Must run BEFORE the session key below is derived, so the turn lands in the topic
+        # session and the launcher session stays untouched. No-op unless that DM switched the mode
+        # on with ``/topic`` (state file written by the adapter); never raises, falls back to the
+        # main DM.
+        event, source = await self._hm_maybe_auto_open_feishu_topic(event, source)
+
         _quick_key = self._session_key_for_source(source)
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
