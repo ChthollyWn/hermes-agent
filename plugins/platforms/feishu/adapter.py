@@ -3447,15 +3447,28 @@ class FeishuAdapter(BasePlatformAdapter):
         return "dm" if event_chat_type == "p2p" else "group"
 
     async def _resolve_sender_profile(self, sender_id: Any, *, is_bot: bool = False) -> Dict[str, Optional[str]]:
-        """Map Feishu's ID tiers onto SessionSource: user_id (tenant) > open_id (app) as primary,
-        union_id (developer-scoped, cross-app stable) as user_id_alt — session keys prefer the alt."""
+        """Map Feishu's ID tiers onto SessionSource: user_id (tenant) > open_id (app) as primary.
+
+        ``user_id_alt`` prefers union_id (cross-app stable session key). When union_id is absent but
+        both tenant user_id and open_id are present, stash open_id as the alt so FEISHU_ALLOWED_USERS
+        entries of either shape still authorize after contact scopes start emitting tenant ids.
+        """
         open_id = getattr(sender_id, "open_id", None) or None
         user_id = getattr(sender_id, "user_id", None) or None
         union_id = getattr(sender_id, "union_id", None) or None
         primary_id = user_id or open_id
+        # Prefer union_id; else keep the non-primary id so allowlists with ou_… keep matching.
+        if union_id:
+            alt_id = union_id
+        elif open_id and user_id and primary_id == user_id:
+            alt_id = open_id
+        elif user_id and open_id and primary_id == open_id:
+            alt_id = user_id
+        else:
+            alt_id = None
         name_lookup_id = open_id if is_bot else (primary_id or union_id)  # bots/basic_batch only takes open_id
         display_name = await self._resolve_sender_name_from_api(name_lookup_id, is_bot=is_bot)
-        return {"user_id": primary_id, "user_name": display_name, "user_id_alt": union_id}
+        return {"user_id": primary_id, "user_name": display_name, "user_id_alt": alt_id}
 
     def _get_cached_sender_name(self, sender_id: Optional[str]) -> Optional[str]:
         """Return a cached sender name only while its TTL is still valid."""

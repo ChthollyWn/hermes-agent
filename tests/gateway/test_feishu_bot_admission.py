@@ -380,7 +380,34 @@ def test_resolve_sender_profile_uses_open_id_for_bot_name_lookup():
 
     assert seen_ids == ["ou_peer"]
     assert profile["user_id"] == "u_peer"
+    assert profile["user_id_alt"] == "on_peer"
     assert profile["user_name"] == "Peer Bot"
+
+
+def test_resolve_sender_profile_stashes_open_id_as_alt_when_no_union():
+    """Contact-scoped events emit tenant user_id; keep open_id on alt for allowlists."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    adapter = object.__new__(FeishuAdapter)
+    adapter._client = None
+    adapter._sender_name_cache = {}
+
+    async def _no_name(*_a, **_k):
+        return None
+
+    adapter._resolve_sender_name_from_api = _no_name
+
+    profile = asyncio.run(
+        adapter._resolve_sender_profile(
+            SimpleNamespace(open_id="ou_human", user_id="e6bbgbba", union_id=None),
+            is_bot=False,
+        )
+    )
+    assert profile["user_id"] == "e6bbgbba"
+    assert profile["user_id_alt"] == "ou_human"
 
 
 # --- _allow_group_message matrix -------------------------------------------

@@ -174,6 +174,13 @@ def _principal_matches_allowlist(source, user_id: str, allowed_ids: set) -> bool
     check_ids = {user_id}
     if "@" in user_id:
         check_ids.add(user_id.split("@")[0])
+    # Feishu/Signal-style dual IDs: allowlist may hold open_id while SessionSource.user_id is
+    # the tenant id (or the reverse). Also accept user_id_alt when present.
+    alt = getattr(source, "user_id_alt", None)
+    if alt:
+        alt_s = str(alt).strip()
+        if alt_s:
+            check_ids.add(alt_s)
 
     # WhatsApp (Baileys + Cloud): phone<->LID / JID aliases match the same principal.
     if source.platform in {Platform.WHATSAPP, Platform.WHATSAPP_CLOUD}:
