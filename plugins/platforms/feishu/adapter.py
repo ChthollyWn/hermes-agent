@@ -3447,22 +3447,20 @@ class FeishuAdapter(BasePlatformAdapter):
         return "dm" if event_chat_type == "p2p" else "group"
 
     async def _resolve_sender_profile(self, sender_id: Any, *, is_bot: bool = False) -> Dict[str, Optional[str]]:
-        """Map Feishu's ID tiers onto SessionSource: user_id (tenant) > open_id (app) as primary.
+        """Map Feishu ID tiers onto SessionSource to match docs + FEISHU_ALLOWED_USERS.
 
-        ``user_id_alt`` prefers union_id (cross-app stable session key). When union_id is absent but
-        both tenant user_id and open_id are present, stash open_id as the alt so FEISHU_ALLOWED_USERS
-        entries of either shape still authorize after contact scopes start emitting tenant ids.
+        Primary ``user_id`` is open_id (always in event payloads; what allowlists store as ou_…).
+        ``user_id_alt`` is union_id when present (session-key stability), else tenant user_id so
+        operators who listed a tenant id still authorize. Never prefer tenant user_id as primary:
+        it only appears after contact scopes and silently broke ou_… allowlists.
         """
         open_id = getattr(sender_id, "open_id", None) or None
         user_id = getattr(sender_id, "user_id", None) or None
         union_id = getattr(sender_id, "union_id", None) or None
-        primary_id = user_id or open_id
-        # Prefer union_id; else keep the non-primary id so allowlists with ou_… keep matching.
+        primary_id = open_id or user_id
         if union_id:
             alt_id = union_id
-        elif open_id and user_id and primary_id == user_id:
-            alt_id = open_id
-        elif user_id and open_id and primary_id == open_id:
+        elif user_id and open_id and user_id != open_id:
             alt_id = user_id
         else:
             alt_id = None

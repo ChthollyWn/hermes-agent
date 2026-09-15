@@ -379,13 +379,13 @@ def test_resolve_sender_profile_uses_open_id_for_bot_name_lookup():
     )
 
     assert seen_ids == ["ou_peer"]
-    assert profile["user_id"] == "u_peer"
+    assert profile["user_id"] == "ou_peer"
     assert profile["user_id_alt"] == "on_peer"
     assert profile["user_name"] == "Peer Bot"
 
 
-def test_resolve_sender_profile_stashes_open_id_as_alt_when_no_union():
-    """Contact-scoped events emit tenant user_id; keep open_id on alt for allowlists."""
+def test_resolve_sender_profile_prefers_open_id_over_tenant_user_id():
+    """Allowlists store ou_…; tenant user_id must not displace open_id as primary."""
     import asyncio
     from types import SimpleNamespace
 
@@ -406,8 +406,8 @@ def test_resolve_sender_profile_stashes_open_id_as_alt_when_no_union():
             is_bot=False,
         )
     )
-    assert profile["user_id"] == "e6bbgbba"
-    assert profile["user_id_alt"] == "ou_human"
+    assert profile["user_id"] == "ou_human"
+    assert profile["user_id_alt"] == "e6bbgbba"
 
 
 # --- _allow_group_message matrix -------------------------------------------
