@@ -558,6 +558,114 @@ class InboundInterceptionTests(unittest.TestCase):
             self.assertEqual(leaked, [])
 
 
+
+class EarlyTopicStampTests(_AdapterHarness):
+    """Adapter must stamp topic thread_id before session claim so main-DM questions parallelize."""
+
+    def _dm_event(self, *, message_id, text="check flights", thread_id=None, chat_type="dm",
+                  chat_id=FEISHU_CHAT, internal=False):
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT if not text.startswith("/") else MessageType.COMMAND,
+            source=SessionSource(
+                platform=Platform.FEISHU, chat_id=chat_id, chat_name="Home",
+                chat_type=chat_type, user_id="ou_owner", user_name="owner", thread_id=thread_id,
+            ),
+            message_id=message_id,
+            internal=internal,
+        )
+
+    def test_mode_on_stamps_before_session_key(self):
+        adapter = self.make_adapter()
+        adapter.set_topic_mode(FEISHU_CHAT, True, user_id="ou_owner")
+        event = self._dm_event(message_id="om_q_early")
+        adapter._maybe_stamp_topic_mode_thread(event)
+        self.assertEqual(event.source.thread_id, "om_q_early")
+        key = adapter._event_session_key(event)
+        self.assertIn("om_q_early", key)
+        self.assertNotEqual(key, build_session_key(_source()))
+
+    def test_mode_off_does_not_stamp(self):
+        adapter = self.make_adapter()
+        event = self._dm_event(message_id="om_q_off")
+        adapter._maybe_stamp_topic_mode_thread(event)
+        self.assertIsNone(event.source.thread_id)
+
+    def test_skips_existing_thread_commands_group_internal(self):
+        adapter = self.make_adapter()
+        adapter.set_topic_mode(FEISHU_CHAT, True, user_id="ou_owner")
+        cases = (
+            self._dm_event(message_id="om_a", thread_id="omt_existing"),
+            self._dm_event(message_id="om_b", text="/status"),
+            self._dm_event(message_id="om_c", chat_type="group"),
+            self._dm_event(message_id="om_d", internal=True),
+            self._dm_event(message_id=None),
+        )
+        for event in cases:
+            before = event.source.thread_id
+            adapter._maybe_stamp_topic_mode_thread(event)
+            self.assertEqual(event.source.thread_id, before)
+
+    def test_gateway_hook_idempotent_after_early_stamp(self):
+        adapter = self.make_adapter()
+        adapter.set_topic_mode(FEISHU_CHAT, True, user_id="ou_owner")
+        source = _source()
+        event = _event(source, message_id="om_q_idem")
+        adapter._maybe_stamp_topic_mode_thread(event)
+        self.assertEqual(event.source.thread_id, "om_q_idem")
+
+        class _Runner(GatewayTopicThreadsMixin):
+            def _adapter_for_source(self, src):
+                return adapter
+
+        out_event, out_source = asyncio.run(_Runner()._hm_maybe_auto_open_feishu_topic(event, event.source))
+        self.assertEqual(out_source.thread_id, "om_q_idem")
+        self.assertIs(out_event.source, event.source)
+
+    def test_two_main_dm_questions_claim_distinct_active_sessions(self):
+        """Regression: without early stamp both claim the launcher key and serialize."""
+        adapter = feishu_adapter.FeishuAdapter(PlatformConfig(enabled=True, token="fake"))
+        adapter._client = _FakeClient()
+        adapter._topic_state_path = lambda: self.state_path
+        adapter._topic_state_cache = None
+        adapter._topic_state_lock = threading.RLock()
+        adapter.set_topic_mode(FEISHU_CHAT, True, user_id="ou_owner")
+
+        started = []
+        release = asyncio.Event()
+
+        async def handler(ev):
+            started.append(ev.message_id)
+            await release.wait()
+            return "ok"
+
+        adapter.set_message_handler(handler)
+
+        async def drive():
+            e1 = self._dm_event(message_id="om_q1", text="question one")
+            e2 = self._dm_event(message_id="om_q2", text="question two")
+            await adapter._handle_message_with_guards(e1)
+            await adapter._handle_message_with_guards(e2)
+            self.assertEqual(e1.source.thread_id, "om_q1")
+            self.assertEqual(e2.source.thread_id, "om_q2")
+            k1 = adapter._event_session_key(e1)
+            k2 = adapter._event_session_key(e2)
+            self.assertNotEqual(k1, k2)
+            self.assertIn(k1, adapter._active_sessions)
+            self.assertIn(k2, adapter._active_sessions)
+            for _ in range(100):
+                if len(started) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(sorted(started), ["om_q1", "om_q2"])
+            release.set()
+            pending = [t for t in list(adapter._session_tasks.values()) if not t.done()]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        asyncio.run(drive())
+
+
 class _MetadataCapturingAdapter(BasePlatformAdapter):
     """Minimal adapter that records the metadata of the final send."""
 

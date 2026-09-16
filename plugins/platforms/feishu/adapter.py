@@ -2447,6 +2447,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _handle_message_with_guards(self, event: MessageEvent) -> None:
         """Run one event through the agent pipeline under the per-chat lock (openclaw createChatQueue)."""
+        # Stamp topic-mode thread_id BEFORE handle_message session claim so two main-DM
+        # questions get distinct keys and run in parallel (gateway stamp is too late).
+        self._maybe_stamp_topic_mode_thread(event)
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
@@ -2688,6 +2691,49 @@ class FeishuAdapter(BasePlatformAdapter):
     def topic_mode_enabled(self, chat_id: str = "") -> bool:
         """True when this DM opted into topic mode via ``/topic``."""
         return bool(self.topic_mode_record(chat_id).get("enabled"))
+
+    def _maybe_stamp_topic_mode_thread(self, event: MessageEvent) -> None:
+        """Stamp Feishu topic-mode ``thread_id`` before adapter session key / active-session claim.
+
+        Mirrors ``GatewayTopicThreadsMixin._hm_maybe_auto_open_feishu_topic``: when topic mode is on
+        for this DM, a main-DM question (no thread yet, not a slash command) uses the question's
+        ``message_id`` as ``source.thread_id`` so ``_event_session_key`` / ``_active_sessions`` see
+        ``…:chat_id:message_id`` instead of the launcher key. Without this, the gateway stamp runs
+        only inside the agent handler — after the adapter has already claimed the launcher session
+        — and a second main-DM question serializes behind the first.
+
+        Idempotent with the gateway hook (which returns early when ``thread_id`` is already set).
+        Never raises; never calls Feishu create-topic APIs (the answer reply still opens the topic).
+        """
+        try:
+            if getattr(event, "internal", False):
+                return
+            source = getattr(event, "source", None)
+            if source is None:
+                return
+            if getattr(source, "chat_type", None) != "dm":
+                return
+            if getattr(source, "thread_id", None):
+                return
+            if event.get_command():
+                return
+            message_id = getattr(event, "message_id", None)
+            if not message_id:
+                return
+            chat_id = str(getattr(source, "chat_id", "") or "")
+            if not chat_id or not self.topic_mode_enabled(chat_id):
+                return
+            source.thread_id = str(message_id)
+            try:
+                event.channel_prompt = self._resolve_channel_prompt(chat_id, str(message_id))
+            except Exception:
+                pass
+            logger.info(
+                "[Feishu] topic mode early stamp: chat=%s question=%s → own session key",
+                chat_id, message_id,
+            )
+        except Exception:
+            logger.warning("[Feishu] topic mode early stamp failed", exc_info=True)
 
     def set_topic_mode(self, chat_id: str, enabled: bool, *, user_id: str = "") -> Optional[bool]:
         """Persist the switch for one chat.

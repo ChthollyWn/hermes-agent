@@ -307,11 +307,13 @@ class GatewayTopicThreadsMixin:
 
         The mode is switched on by the user's own ``/topic`` command (persisted per chat by the
         adapter — there is no config key). While it is off the event passes through untouched and the
-        channel behaves exactly like stock Hermes. Runs after authz and BEFORE the session key is
-        derived, so the turn lands in its own session (``...:<chat_id>:<anchor message id>``) instead
-        of the launcher session. The topic itself is opened by the answer's reply — no placeholder
-        post — and the adapter maps that thread back to the anchor for the follow-ups. Commands stay
-        native in the launcher.
+        channel behaves exactly like stock Hermes. Runs after authz and BEFORE the gateway session
+        key is derived, so the turn lands in its own session (``...:<chat_id>:<anchor message id>``)
+        instead of the launcher session. The Feishu adapter also stamps earlier (before its
+        ``_active_sessions`` claim) so consecutive main-DM questions parallelize; this hook stays
+        idempotent when ``thread_id`` is already set. The topic itself is opened by the answer's
+        reply — no placeholder post — and the adapter maps that thread back to the anchor for the
+        follow-ups. Commands stay native in the launcher.
 
         Never raises: a missing adapter, an API failure or an anchorless event falls back to
         answering in the main DM rather than dropping the user's message.
