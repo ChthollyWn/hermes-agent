@@ -1490,12 +1490,24 @@ class FeishuAdapter(BasePlatformAdapter):
                 return False
 
             self._loop = asyncio.get_running_loop()
+            # For websocket: mark degraded *before* spawning the WS thread so a fast
+            # _confirm_ws_connected cannot be overwritten by a later degraded stamp.
+            if self._connection_mode == "websocket":
+                self._running = True
+                self._mark_degraded()
             await self._connect_with_retry()
             if self._connection_mode == "websocket":
                 # The WS thread can die without any external signal; keep a watcher alive.
                 self._ws_supervisor = asyncio.ensure_future(self._supervise_websocket_thread())
-            self._mark_connected()
-            logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
+                # If first-connect already stamped connected during _connect_with_retry, keep it.
+                client = self._ws_client
+                if client is not None and getattr(client, "_hermes_connected_stamped", False):
+                    self._mark_connected()
+                else:
+                    self._mark_degraded()
+            else:
+                self._mark_connected()
+                logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             # Plugin-registered native handlers (lark_oapi client).
             self._wire_plugin_handlers(self._client)
             return True
@@ -4113,7 +4125,68 @@ class FeishuAdapter(BasePlatformAdapter):
             # Without the "channel" UA tag Feishu won't push group @mention events over WS.
             extra_ua_tags=["channel"],
         )
+        self._wire_feishu_ws_lifecycle(self._ws_client)
         self._ws_future = loop.run_in_executor(None, _run_official_feishu_ws_client, self._ws_client, self)
+        # Also covers supervisor-driven rebuilds (connect() only runs once at startup).
+        asyncio.ensure_future(self._confirm_ws_connected(), loop=loop)
+
+    def _wire_feishu_ws_lifecycle(self, ws_client: Any) -> None:
+        """Mirror Lark WS reconnect lifecycle into gateway runtime status.
+
+        Lark auto-reconnects after keepalive drops, but Hermes previously stamped
+        connected as soon as the WS thread started and never updated status on
+        SDK reconnect — producing zombie "connected" rows. Prefer degraded over
+        disconnected here: ``_mark_disconnected`` clears ``_running`` and would
+        stop the thread supervisor.
+        """
+
+        def _on_reconnecting() -> None:
+            logger.warning("[Feishu] WebSocket reconnecting (marking degraded)")
+            try:
+                self._mark_degraded()
+            except Exception:
+                logger.debug("[Feishu] on_reconnecting status update failed", exc_info=True)
+
+        def _on_reconnected() -> None:
+            try:
+                setattr(ws_client, "_hermes_connected_stamped", True)
+            except Exception:
+                pass
+            try:
+                self._mark_connected()
+            except Exception:
+                logger.debug("[Feishu] on_reconnected status update failed", exc_info=True)
+            logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
+
+        ws_client.on_reconnecting = _on_reconnecting
+        ws_client.on_reconnected = _on_reconnected
+
+    async def _confirm_ws_connected(self, *, timeout_seconds: float = 30.0) -> None:
+        """Upgrade degraded → connected once Lark has a live ``_conn`` (first connect)."""
+        client_at_start = self._ws_client
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            if self._ws_client is not client_at_start:
+                return  # replaced by a newer connect attempt
+            if client_at_start is not None and getattr(client_at_start, "_hermes_connected_stamped", False):
+                return
+            if client_at_start is not None and getattr(client_at_start, "_conn", None) is not None:
+                try:
+                    setattr(client_at_start, "_hermes_connected_stamped", True)
+                except Exception:
+                    pass
+                self._mark_connected()
+                logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
+                return
+            if not self._running and self._ws_client is None:
+                return
+            await asyncio.sleep(0.25)
+        if self._running and self._ws_client is client_at_start:
+            # Thread still up but socket not observed — keep degraded and let
+            # on_reconnected / supervisor handle recovery.
+            logger.warning(
+                "[Feishu] Timed out waiting for first WebSocket connect; leaving status degraded"
+            )
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:
